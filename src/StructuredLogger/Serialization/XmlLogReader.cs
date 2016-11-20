@@ -1,90 +1,146 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Linq;
-using System.Reflection;
-using System.Xml.Linq;
+using System.Xml;
 
 namespace Microsoft.Build.Logging.StructuredLogger
 {
     public class XmlLogReader
     {
-        public static Build ReadFromXml(string xmlFilePath, Action<string> statusUpdate = null)
+        private StringCache stringTable;
+        private XmlReader reader;
+        private readonly List<KeyValuePair<string, string>> attributes = new List<KeyValuePair<string, string>>(10);
+
+        public static Build ReadFromXml(string xmlFilePath)
         {
-            Build build = null;
+            return new XmlLogReader().Read(xmlFilePath);
+        }
+
+        public Build Read(string filePath)
+        {
+            Build build = new Build();
+            this.stringTable = build.StringTable;
+
+            var stack = new Stack<object>(1024);
+            stack.Push(build);
 
             try
             {
-                if (statusUpdate != null)
+                var xmlReaderSettings = new XmlReaderSettings()
                 {
-                    statusUpdate("Loading " + xmlFilePath);
-                }
+                    IgnoreWhitespace = true,
+                };
 
-                var doc = XDocument.Load(xmlFilePath, LoadOptions.PreserveWhitespace);
-                var root = doc.Root;
-
-                if (statusUpdate != null)
+                using (reader = XmlReader.Create(filePath, xmlReaderSettings))
                 {
-                    statusUpdate("Populating tree");
-                }
+                    reader.MoveToContent();
 
-                var reader = new XmlLogReader();
-                build = (Build)reader.ReadNode(root);
+                    ReadAttributes();
+                    PopulateAttributes(build); // read the attributes on the root Build element that we created manually
+
+                    while (reader.Read())
+                    {
+                        switch (reader.NodeType)
+                        {
+                            case XmlNodeType.Element:
+                                var node = ReadNode();
+
+                                var parent = (TreeNode)stack.Peek();
+                                parent.AddChild(node);
+
+                                if (!reader.IsEmptyElement)
+                                {
+                                    stack.Push(node);
+                                }
+
+                                break;
+                            case XmlNodeType.EndElement:
+                                stack.Pop();
+                                break;
+                            case XmlNodeType.Text:
+                                {
+                                    var valueNode = stack.Peek();
+                                    var nameValueNode = valueNode as NameValueNode;
+                                    if (nameValueNode != null)
+                                    {
+                                        nameValueNode.Value = GetCurrentValue();
+                                    }
+                                    else
+                                    {
+                                        var message = valueNode as Message;
+                                        if (message != null)
+                                        {
+                                            message.Text = GetCurrentValue();
+                                        }
+                                    }
+
+                                    break;
+                                }
+                            case XmlNodeType.Whitespace:
+                                {
+                                    var valueNode = stack.Peek();
+                                    var nameValueNode = valueNode as NameValueNode;
+                                    if (nameValueNode != null)
+                                    {
+                                        nameValueNode.Value = GetCurrentValue();
+                                    }
+                                    else
+                                    {
+                                        var message = valueNode as Message;
+                                        if (message != null)
+                                        {
+                                            message.Text = GetCurrentValue();
+                                        }
+                                    }
+
+                                    break;
+                                }
+                            case XmlNodeType.None:
+                            case XmlNodeType.Attribute:
+                            case XmlNodeType.CDATA:
+                            case XmlNodeType.EntityReference:
+                            case XmlNodeType.Entity:
+                            case XmlNodeType.ProcessingInstruction:
+                            case XmlNodeType.Comment:
+                            case XmlNodeType.Document:
+                            case XmlNodeType.DocumentType:
+                            case XmlNodeType.DocumentFragment:
+                            case XmlNodeType.Notation:
+                            case XmlNodeType.SignificantWhitespace:
+                            case XmlNodeType.EndEntity:
+                            case XmlNodeType.XmlDeclaration:
+                            default:
+                                break;
+                        }
+                    }
+                }
             }
             catch (Exception ex)
             {
                 build = new Build() { Succeeded = false };
-                build.AddChild(new Error() { Text = "Error when opening file: " + xmlFilePath });
+                build.AddChild(new Error() { Text = "Error when opening file: " + filePath });
                 build.AddChild(new Error() { Text = ex.ToString() });
             }
 
             return build;
         }
 
-        private StringTable stringTable;
-
-        private enum AttributeNames
+        private string GetCurrentValue()
         {
-            Name,
-            IsLowRelevance,
-            Text,
-            ProjectFile,
-            DependsOnTargets,
-            FromAssembly,
-            CommandLineArguments,
-            Code,
-            File,
-            LineNumber,
-            ColumnNumber,
-            EndLineNumber,
-            EndColumnNumber,
-            StartTime,
-            EndTime,
-            Succeeded,
-            Timestamp,
-            IsAnalyzed
+            return stringTable.Intern(reader.Value);
         }
 
-        private static readonly XName[] attributeNames = typeof(AttributeNames)
-            .GetFields(BindingFlags.Public | BindingFlags.Static)
-            .Select(f => XNamespace.None.GetName(f.Name)).ToArray();
-
-        private static readonly Dictionary<string, Type> objectModelTypes =
-            typeof(TreeNode)
-                .Assembly
-                .GetTypes()
-                .Where(t => typeof(TreeNode).IsAssignableFrom(t))
-                .ToDictionary(t => t.Name);
-
-        private object ReadNode(XElement element)
+        private object ReadNode()
         {
-            var name = element.Name.LocalName;
+            var name = stringTable.Intern(reader.Name);
 
+            ReadAttributes();
+
+            // shortcut for most common types (Metadata and Property)
             if (name == "Metadata")
             {
                 var metadata = new Metadata()
                 {
-                    Name = GetString(element, AttributeNames.Name),
-                    Value = stringTable.Intern(element.Value)
+                    Name = GetString(AttributeNames.Name)
                 };
 
                 return metadata;
@@ -93,65 +149,42 @@ namespace Microsoft.Build.Logging.StructuredLogger
             {
                 var property = new Property()
                 {
-                    Name = GetString(element, AttributeNames.Name),
-                    Value = stringTable.Intern(element.Value)
+                    Name = GetString(AttributeNames.Name)
                 };
 
                 return property;
             }
 
-            Type type = null;
-            if (!objectModelTypes.TryGetValue(name, out type))
+            object node = Serialization.CreateNode(name);
+
+            var folder = node as Folder;
+            if (folder != null)
             {
-                type = typeof(Folder);
+                folder.Name = name;
+                folder.IsLowRelevance = GetBoolean(AttributeNames.IsLowRelevance);
+                return folder;
             }
 
-            var node = (TreeNode)Activator.CreateInstance(type);
-
-            var build = node as Build;
-            if (build != null)
-            {
-                this.stringTable = build.StringTable;
-            }
-
-            ReadAttributes(node, element);
-
-            if (element.HasElements)
-            {
-                foreach (var childElement in element.Elements())
-                {
-                    var childNode = ReadNode(childElement);
-                    node.AddChild(childNode);
-                }
-            }
+            PopulateAttributes(node);
 
             return node;
         }
 
-        private void ReadAttributes(TreeNode node, XElement element)
+        private void PopulateAttributes(object node)
         {
             var item = node as Item;
             if (item != null)
             {
-                item.Name = GetString(element, AttributeNames.Name);
-                item.Text = GetString(element, AttributeNames.Text);
+                item.Name = GetString(AttributeNames.Name);
+                item.Text = GetString(AttributeNames.Text);
                 return;
             }
 
             var message = node as Message;
             if (message != null)
             {
-                message.IsLowRelevance = GetBoolean(element, AttributeNames.IsLowRelevance);
-                message.Timestamp = GetDateTime(element, AttributeNames.Timestamp);
-                message.Text = stringTable.Intern(element.Value);
-                return;
-            }
-
-            var folder = node as Folder;
-            if (folder != null)
-            {
-                folder.IsLowRelevance = GetBoolean(element, AttributeNames.IsLowRelevance);
-                folder.Name = GetString(element, AttributeNames.Name);
+                message.IsLowRelevance = GetBoolean(AttributeNames.IsLowRelevance);
+                message.Timestamp = GetDateTime(AttributeNames.Timestamp);
                 return;
             }
 
@@ -159,119 +192,117 @@ namespace Microsoft.Build.Logging.StructuredLogger
             var namedNode = node as NamedNode;
             if (namedNode != null)
             {
-                namedNode.Name = GetString(element, AttributeNames.Name);
+                namedNode.Name = GetString(AttributeNames.Name);
             }
 
             var textNode = node as TextNode;
             if (textNode != null)
             {
-                textNode.Text = GetString(element, AttributeNames.Text);
+                textNode.Text = GetString(AttributeNames.Text);
             }
 
             var timedNode = node as TimedNode;
             if (timedNode != null)
             {
-                AddStartAndEndTime(element, timedNode);
+                AddStartAndEndTime(timedNode);
             }
 
             // finally, concrete tests with early exit, sorted by commonality
             var diagnostic = node as AbstractDiagnostic;
             if (diagnostic != null)
             {
-                diagnostic.Code = GetString(element, AttributeNames.Code);
-                diagnostic.File = GetString(element, AttributeNames.File);
-                diagnostic.LineNumber = GetInteger(element, AttributeNames.LineNumber);
-                diagnostic.ColumnNumber = GetInteger(element, AttributeNames.ColumnNumber);
-                diagnostic.EndLineNumber = GetInteger(element, AttributeNames.EndLineNumber);
-                diagnostic.EndColumnNumber = GetInteger(element, AttributeNames.EndColumnNumber);
-                diagnostic.ProjectFile = GetString(element, AttributeNames.ProjectFile);
+                diagnostic.Code = GetString(AttributeNames.Code);
+                diagnostic.File = GetString(AttributeNames.File);
+                diagnostic.LineNumber = GetInteger(AttributeNames.LineNumber);
+                diagnostic.ColumnNumber = GetInteger(AttributeNames.ColumnNumber);
+                diagnostic.EndLineNumber = GetInteger(AttributeNames.EndLineNumber);
+                diagnostic.EndColumnNumber = GetInteger(AttributeNames.EndColumnNumber);
+                diagnostic.ProjectFile = GetString(AttributeNames.ProjectFile);
                 return;
             }
 
             var task = node as Task;
             if (task != null)
             {
-                task.FromAssembly = GetString(element, AttributeNames.FromAssembly);
-                task.CommandLineArguments = GetString(element, AttributeNames.CommandLineArguments);
+                task.FromAssembly = GetString(AttributeNames.FromAssembly);
+                task.CommandLineArguments = GetString(AttributeNames.CommandLineArguments);
                 return;
             }
 
             var target = node as Target;
             if (target != null)
             {
-                target.IsLowRelevance = GetBoolean(element, AttributeNames.IsLowRelevance);
-                target.DependsOnTargets = GetString(element, AttributeNames.DependsOnTargets);
+                target.IsLowRelevance = GetBoolean(AttributeNames.IsLowRelevance);
+                target.DependsOnTargets = GetString(AttributeNames.DependsOnTargets);
                 return;
             }
 
             var project = node as Project;
             if (project != null)
             {
-                project.ProjectFile = GetString(element, AttributeNames.ProjectFile);
+                project.ProjectFile = GetString(AttributeNames.ProjectFile);
                 return;
             }
 
             var build = node as Build;
             if (build != null)
             {
-                build.Succeeded = GetBoolean(element, AttributeNames.Succeeded);
-                build.IsAnalyzed = GetBoolean(element, AttributeNames.IsAnalyzed);
+                build.Succeeded = GetBoolean(AttributeNames.Succeeded);
+                build.IsAnalyzed = GetBoolean(AttributeNames.IsAnalyzed);
                 return;
             }
         }
 
-        private void AddStartAndEndTime(XElement element, TimedNode node)
+        private void ReadAttributes()
         {
-            node.StartTime = GetDateTime(element, AttributeNames.StartTime);
-            node.EndTime = GetDateTime(element, AttributeNames.EndTime);
-        }
+            attributes.Clear();
 
-        private bool GetBoolean(XElement element, AttributeNames attributeIndex)
-        {
-            var text = GetString(element, attributeIndex);
-            if (text == null)
+            if (reader.HasAttributes)
             {
-                return false;
+                if (reader.MoveToFirstAttribute())
+                {
+                    do
+                    {
+                        var attributeName = stringTable.Intern(reader.Name);
+                        var attributeValue = stringTable.Intern(reader.Value);
+                        attributes.Add(new KeyValuePair<string, string>(attributeName, attributeValue));
+                    }
+                    while (reader.MoveToNextAttribute());
+                    reader.MoveToElement();
+                }
             }
-
-            bool result;
-            bool.TryParse(text, out result);
-            return result;
         }
 
-        private DateTime GetDateTime(XElement element, AttributeNames attributeIndex)
+        private void AddStartAndEndTime(TimedNode node)
         {
-            var text = GetString(element, attributeIndex);
-            if (text == null)
-            {
-                return default(DateTime);
-            }
-
-            DateTime result;
-            DateTime.TryParse(text, out result);
-            return result;
+            node.StartTime = GetDateTime(AttributeNames.StartTime);
+            node.EndTime = GetDateTime(AttributeNames.EndTime);
         }
 
-        private int GetInteger(XElement element, AttributeNames attributeIndex)
+        private bool GetBoolean(AttributeNames attributeIndex)
         {
-            var text = GetString(element, attributeIndex);
-            if (text == null)
-            {
-                return 0;
-            }
-
-            int result;
-            int.TryParse(text, out result);
-            return result;
+            return Serialization.GetBoolean(GetString(attributeIndex));
         }
 
-        private string GetString(XElement element, AttributeNames attributeIndex)
+        private DateTime GetDateTime(AttributeNames attributeIndex)
         {
-            var attributeName = attributeNames[(int)attributeIndex];
-            var attribute = element.Attribute(attributeName);
-            if (attribute != null)
+            return Serialization.GetDateTime(GetString(attributeIndex));
+        }
+
+        private int GetInteger(AttributeNames attributeIndex)
+        {
+            return Serialization.GetInteger(GetString(attributeIndex));
+        }
+
+        private string GetString(AttributeNames attributeIndex)
+        {
+            var attributeName = Serialization.AttributeLocalNameList[(int)attributeIndex];
+            for (int i = 0; i < attributes.Count; i++)
             {
-                return stringTable.Intern(attribute.Value);
+                if (attributeName == attributes[i].Key)
+                {
+                    return attributes[i].Value;
+                }
             }
 
             return null;
